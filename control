@@ -1,0 +1,9 @@
+Package: dylv.liquidglass
+Name: LiquidGlass
+Version: 0.0.1
+Architecture: iphoneos-arm64
+Description: Liquid Glass refraction effect for iOS 16
+Maintainer: dylv
+Author: dylv
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
