@@ -123,7 +123,7 @@ jobs:
           artifacts: "./all-packages/*.deb"
           allowUpdates: true
           tag: nightly
-          name: "Nightly"
+          name: "deb"
           body: |
             This build was automatically generated from the latest commit on `main`.
             
@@ -132,5 +132,4 @@ jobs:
             
             > [!NOTE]
             > This prototype tweak will forever stay on version `0.0.1`.
-          prerelease: true
           token: ${{ secrets.GITHUB_TOKEN }}
