@@ -24,6 +24,7 @@ static NSString * const kLGFilterType = @"dylv.liquidglass.refraction";
 @property (nonatomic, assign) CGFloat blurRadius;
 - (instancetype)initWithFrame:(CGRect)frame blurRadius:(CGFloat)radius;
 - (void)applyFilters;
+- (void)forceReapplyForRegistrationRace;
 @end
 
 @implementation LGLiveBackdropView
@@ -37,6 +38,7 @@ static NSString * const kLGFilterType = @"dylv.liquidglass.refraction";
     if (!self) return nil;
     _blurRadius             = radius;
     self.userInteractionEnabled = NO;
+    self.backgroundColor    = [UIColor clearColor];
     self.opaque             = NO;
     [self applyFilters];
     return self;
@@ -50,19 +52,22 @@ static NSString * const kLGFilterType = @"dylv.liquidglass.refraction";
     Class backdropCls = NSClassFromString(@"CABackdropLayer");
     if (!backdropCls || ![layer isKindOfClass:backdropCls]) return;
 
-    // skip if filter already set, prevents oom from repeated surface alloc
-    NSArray *existing = layer.filters;
-    if (existing.count == 1) {
-        NSString *type = nil;
-        @try { type = [existing[0] valueForKey:@"type"]; } @catch (...) {}
-        if ([type isEqualToString:kLGFilterType]) return;
-    }
-
     @try {
         [layer setValue:@NO  forKey:@"layerUsesCoreImageFilters"];
         [layer setValue:@YES forKey:@"windowServerAware"];
         if (![layer valueForKey:@"groupName"])
-            [layer setValue:NSUUID.UUID.UUIDString forKey:@"groupName"];
+            [layer setValue:@"dylv.liquidglass.sharedGroup" forKey:@"groupName"];
+
+        [layer setValue:@"dylv.liquidglass" forKey:@"groupNamespace"];
+        [layer setValue:@(0.5) forKey:@"scale"];
+
+        // skip if filter already set, prevents oom from repeated surface alloc
+        NSArray *existing = layer.filters;
+        if (existing.count == 1) {
+            NSString *type = nil;
+            @try { type = [existing[0] valueForKey:@"type"]; } @catch (...) {}
+            if ([type isEqualToString:kLGFilterType]) return;
+        }
 
         Class filterCls = NSClassFromString(@"CAFilter");
         if (!filterCls) { sblog("CAFilter class not found"); return; }
@@ -83,11 +88,27 @@ static NSString * const kLGFilterType = @"dylv.liquidglass.refraction";
     }
 }
 
+- (void)forceReapplyForRegistrationRace {
+    CALayer *layer = self.layer;
+    Class backdropCls = NSClassFromString(@"CABackdropLayer");
+    if (!backdropCls || ![layer isKindOfClass:backdropCls]) return;
+    Class filterCls = NSClassFromString(@"CAFilter");
+    if (!filterCls) return;
+    @try {
+        id glassFilter = ((id (*)(Class, SEL, NSString *))objc_msgSend)(
+            filterCls, NSSelectorFromString(@"filterWithType:"), kLGFilterType);
+        if (!glassFilter) return;
+        layer.filters = @[glassFilter];
+        sblog("forceReapply: re-committed filter (defeating registration race)");
+    } @catch (NSException *e) {
+        sblog("forceReapply exception: %s", e.reason.UTF8String);
+    }
+}
+
 @end
 
 @interface LGFloatingTestView : UIView {
     LGLiveBackdropView     *_backdropView;
-    UIView                 *_tintView;
     UIView                 *_specularBorder;
     UIPanGestureRecognizer *_pan;
     CGPoint                 _dragOffset;
@@ -106,10 +127,10 @@ static NSString * const kLGFilterType = @"dylv.liquidglass.refraction";
 
     const CGFloat radius = 28.0;
 
+    self.backgroundColor        = [UIColor clearColor];
     self.userInteractionEnabled = YES;
     self.layer.cornerRadius     = radius;
     self.layer.cornerCurve      = kCACornerCurveContinuous;
-    // must be off - CABackdropLayer needs unclipped compositor access
     self.layer.masksToBounds    = NO;
 
     _backdropView = [[LGLiveBackdropView alloc] initWithFrame:self.bounds
@@ -121,11 +142,15 @@ static NSString * const kLGFilterType = @"dylv.liquidglass.refraction";
     _backdropView.layer.masksToBounds = YES;
     [self addSubview:_backdropView];
 
-    _tintView = [[UIView alloc] initWithFrame:self.bounds];
-    _tintView.autoresizingMask =
-        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    _tintView.userInteractionEnabled = NO;
-    [self addSubview:_tintView];
+    // recommit over the first ~12s to beat registration race
+    __weak LGLiveBackdropView *weakBackdrop = _backdropView;
+    for (NSNumber *delay in @[ @1.5, @3.0, @5.0, @8.0, @12.0 ]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakBackdrop forceReapplyForRegistrationRace];
+        });
+    }
 
     _specularBorder = [[UIView alloc] initWithFrame:self.bounds];
     _specularBorder.autoresizingMask =
@@ -156,7 +181,6 @@ static NSString * const kLGFilterType = @"dylv.liquidglass.refraction";
                                       pt.y - self.center.y);
             break;
         case UIGestureRecognizerStateChanged: {
-            // disable implicit spring animation, prevents glass content from lagging
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
             self.center = CGPointMake(pt.x - _dragOffset.x,

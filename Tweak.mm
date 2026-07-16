@@ -28,48 +28,29 @@ static void lglog(const char *fmt, ...) {
 #import <os/lock.h>
 #include <sys/mman.h>
 #include <unordered_map>
+#include <fcntl.h>
 
-
-// fallback addresses for iOS 16.7.11
-static const uintptr_t kFB_FilterTable   = 0x1e1deee30;
-static const uintptr_t kFB_GaussianCtx   = 0x1dcdf1710;
-static const uintptr_t kFB_StopEncoders  = 0x188340284;
-static const uintptr_t kFB_InternAtom    = 0x1883405a0;
-static const uintptr_t kFB_AddFilter     = 0x188392e18;
-
-static intptr_t getSlide(void) {
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "QuartzCore"))
-            return _dyld_get_image_vmaddr_slide(i);
-    }
-    return 0;
-}
-
-static void *resolveWithFallback(const char *label, void *resolved, uintptr_t fallbackUnslid) {
-    if (resolved) {
+static void *logResolveResult(const char *label, void *resolved) {
+    if (resolved)
         lglog("resolve %s: scanner -> %p", label, resolved);
-        return resolved;
-    }
-    intptr_t slide = getSlide();
-    void *fb = (void *)(fallbackUnslid + slide);
-    lglog("resolve %s: scanner returned null, using FALLBACK %p (slide=%tx)", label, fb, slide);
-    return fb;
+    else
+        lglog("resolve %s: FAILED, build not supported by scanner (no fallback)", label);
+    return resolved;
 }
 
-// must match string in LiquidGlassSB/Tweak.x
-static const char *kCustomFilterTypeName  = "dylv.liquidglass.refraction";
+// must match kLGFilterType in LiquidGlassSB/Tweak.x exactly
+static const char *kCustomFilterTypeName = "dylv.liquidglass.refraction";
 
-static const ptrdiff_t kMtlDeviceOffset  = 0xb20;
-static const ptrdiff_t kMtlCmdBufOffset  = 0xb38;
+// resolved dynamically at init, -1 until resolved (0xaa8 on 15.8.8, 0xb38 on 16.x)
+static ptrdiff_t g_cmdBufOffset = -1;
 
-static const ptrdiff_t kSurfTexOffset    = 0x58;
-static const ptrdiff_t kSurfWidthOffset  = 0x70;
-static const ptrdiff_t kSurfHeightOffset = 0x78;
+// surface's primary MTLTexture, stable across 15.8.8 and 16.x
+static const ptrdiff_t kSurfTexOffset = 0x58;
 
+// how many vtable slots to copy (covers slot 0..21)
 static const size_t kVtableSlots = 22;
 
+// uniforms, mirrors struct in the metal shader exactly (layout must match)
 typedef struct __attribute__((packed)) {
     simd_float2 resolution;
     simd_float2 screenResolution;
@@ -109,10 +90,9 @@ typedef void     (*AddFilterFn)(uint32_t, void*);
 static StopEncodersFn  g_stopEncoders   = nullptr;
 static InternAtomFn    g_internAtom     = nullptr;
 static AddFilterFn     g_addFilter      = nullptr;
-static Render13Fn      g_origGaussR13   = nullptr; // original slot13 we call after our pass
-static void           *g_gaussCtxValue  = nullptr;
+static Render13Fn      g_origGaussR13   = nullptr; // original render we call after our pass
+static void           *g_gaussCtxValue  = nullptr; // gaussian's CAML::Context value, not the slot ptr
 static bool            g_filterRegistered = false;
-
 
 static void  **g_customVtable = nullptr; // mmap'd 22-slot vtable
 static void   *g_customCtx    = nullptr; // mmap'd CAML::Context-shaped block
@@ -124,8 +104,11 @@ static os_unfair_lock g_pipelineLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock g_ppLock       = OS_UNFAIR_LOCK_INIT;
 static bool           g_pipelineInit = false;
 
+// single output texture, no A/B ping-pong (that caused ghosting). heap
+// allocated so it survives past CXA finalization.
 static std::unordered_map<uint64_t, id<MTLTexture>> *g_outTex = nullptr;
 
+// clears ARC-managed globals before CXA finalization
 __attribute__((destructor))
 static void liquidGlassShutdown(void) {
     g_pipeline    = nil;
@@ -230,7 +213,6 @@ float3 lchToSrgb(float3 lch) {
     return xyzToSrgb(labToXyz(lab));
 }
 
-
 kernel void liquidGlass(
     texture2d<float, access::sample> src [[texture(0)]],
     texture2d<float, access::write>  dst [[texture(1)]],
@@ -291,6 +273,12 @@ kernel void liquidGlass(
         clamp(1.0 - max(0.0, distFromCenter -
               (useCircularGeometry ? shortest * 0.5 : R)), 0.0, 1.0) : 1.0;
 
+    // flat interior pixels reduce to a raw passthrough sample
+    if (!useCircularGeometry && !inCorner && distFromSide >= bezel) {
+        dst.write(src.sample(s, localUV), gid);
+        return;
+    }
+
     float bezelRatio = clamp(distFromSide / bezel, 0.0, 1.0);
     float normDisp   = (distFromSide < bezel) ?
         displacementAtRatio(bezelRatio, u.glassThickness, bezel, eta) : 0.0;
@@ -310,14 +298,6 @@ kernel void liquidGlass(
     sampleUV = clamp(sampleUV, 0.0, 1.0);
 
     float4 bg = src.sample(s, sampleUV);
-    float2 prismOff    = dispPx / max(u.wallpaperResolution, float2(1.0));
-    float  dispersion  = clamp(length(prismOff) * 24.0, 0.0, 0.012);
-    float2 redUV       = clamp(sampleUV - prismOff * 0.55, 0.0, 1.0);
-    float2 blueUV      = clamp(sampleUV + prismOff * 0.55, 0.0, 1.0);
-    float3 dispersed   = float3(src.sample(s, mix(sampleUV, redUV,  dispersion * 6.0)).r,
-                                bg.g,
-                                src.sample(s, mix(sampleUV, blueUV, dispersion * 6.0)).b);
-    bg.rgb = mix(bg.rgb, dispersed, dispersion * 0.4);
 
     float2 lightDir    = float2(cos(u.specularAngle), -sin(u.specularAngle));
     float2 specDir     = dir;
@@ -350,7 +330,6 @@ kernel void liquidGlass(
 }
 )MSL";
 
-
 static void ensurePipeline(__unsafe_unretained id<MTLDevice> device) {
     os_unfair_lock_lock(&g_pipelineLock);
     if (!g_pipelineInit) {
@@ -374,8 +353,9 @@ static void ensurePipeline(__unsafe_unretained id<MTLDevice> device) {
     os_unfair_lock_unlock(&g_pipelineLock);
 }
 
+// corner radius/bezel as a ratio of the shortest surface side, recomputed per frame
 static const float kCornerRadiusRatio = 28.0f / 220.0f;
-static const float kBezelWidthRatio   = 36.0f / 220.0f;
+static const float kBezelWidthRatio   = kCornerRadiusRatio * 1.4f;
 
 static void ensureUniforms(__unsafe_unretained id<MTLDevice> device, uint64_t w, uint64_t h) {
     if (g_uniformsBuf) return; // buffer itself only needs allocating once
@@ -434,49 +414,33 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
                                float opacity, void *surface, float scale,
                                bool flag, void *cm, void *shape, float *out)
 {
-    static uint64_t callCount = 0;
-    ++callCount;
-
-    if (callCount == 1) {
-        lglog("ourCustomRender13 first call FULL ARGS:");
-        lglog("  self=%p filter=%p layer=%p ctx=%p", self, filter, layer, ctx);
-        lglog("  opacity=%.3f surface=%p scale=%.3f flag=%d", opacity, surface, scale, (int)flag);
-        lglog("  cm=%p shape=%p out=%p", cm, shape, out);
-        lglog("  g_customCtx=%p", g_customCtx);
-        lglog("  ctx==g_customCtx: %s", ctx == g_customCtx ? "YES, x3 is CAML::Context" : "no, x3 is MetalContext");
-        for (void *candidate : {self, filter, layer, ctx}) {
-            @try {
-                void *maybeDevice = *(void **)((uint8_t *)candidate + 0xb20);
-                lglog("  candidate %p + 0xb20 = %p %s",
-                      candidate, maybeDevice,
-                      maybeDevice ? "(non-null, likely MetalCtx)" : "(null)");
-            } @catch (...) {}
-        }
-    } else if (callCount % 60 == 1) {
-        lglog("ourCustomRender13 #%llu opacity=%.3f surface=%p ctx=%p match=%s",
-              callCount, opacity, surface, ctx,
-              ctx == g_customCtx ? "ctx=ours" : "ctx=MetalCtx");
-    }
+    static uint64_t tsum_stop = 0, tsum_ours = 0, tsum_gauss = 0, tcount = 0;
+    uint64_t t_start = mach_absolute_time();
 
     auto *metalCtx = (uint8_t *)ctx;
     auto *surf     = (uint8_t *)surface;
 
-    void *rawDevice  = *(void **)(metalCtx + kMtlDeviceOffset);
-    void *rawCmdBuf  = *(void **)(metalCtx + kMtlCmdBufOffset);
-    void *rawOrigTex = *(void **)(surf      + kSurfTexOffset);
-
-    if (!rawDevice || !rawCmdBuf || !rawOrigTex) {
-        lglog("ourCustomRender13: early exit, device=%p cmdBuf=%p origTex=%p",
-              rawDevice, rawCmdBuf, rawOrigTex);
+    if (g_cmdBufOffset < 0) {
+        lglog("ourCustomRender13: command-buffer offset unresolved, skipping");
         return;
     }
 
-    __unsafe_unretained id<MTLDevice>        device  = (__bridge id<MTLDevice>)rawDevice;
+    void *rawCmdBuf  = *(void **)(metalCtx + g_cmdBufOffset);
+    void *rawOrigTex = *(void **)(surf     + kSurfTexOffset);
+
+    if (!rawCmdBuf || !rawOrigTex) {
+        lglog("ourCustomRender13: early exit, cmdBuf=%p origTex=%p", rawCmdBuf, rawOrigTex);
+        return;
+    }
+
     __unsafe_unretained id<MTLCommandBuffer> cmdBuf  = (__bridge id<MTLCommandBuffer>)rawCmdBuf;
     __unsafe_unretained id<MTLTexture>       origTex = (__bridge id<MTLTexture>)rawOrigTex;
 
-    uint64_t w = *(uint64_t *)(surf + kSurfWidthOffset);
-    uint64_t h = *(uint64_t *)(surf + kSurfHeightOffset);
+    __unsafe_unretained id<MTLDevice> device = origTex.device;
+    if (!device) { lglog("ourCustomRender13: origTex has no device, skip"); return; }
+
+    uint64_t w = (uint64_t)origTex.width;
+    uint64_t h = (uint64_t)origTex.height;
     if (w == 0 || h == 0) { lglog("ourCustomRender13: zero dims, skip"); return; }
 
     ensurePipeline(device);
@@ -511,59 +475,52 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
 
     void *savedOrigTex = rawOrigTex;
 
-    static uint64_t tsum_stop=0, tsum_compute=0, tsum_gauss=0, tcount=0;
-    uint64_t t0 = mach_absolute_time();
-
-    if (!g_stopEncoders) { lglog("ourCustomRender13: g_stopEncoders null, skip"); return; }
+    if (!g_stopEncoders) { lglog("ourCustomRender13: null stopEncoders"); return; }
     g_stopEncoders(ctx);
-
-    uint64_t t1 = mach_absolute_time();
+    uint64_t t_afterStop = mach_absolute_time();
 
     id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    if (!enc) { lglog("ourCustomRender13: nil compute encoder"); return; }
-
+    if (!enc) { lglog("ourCustomRender13: nil encoder"); return; }
     [enc setComputePipelineState:g_pipeline];
     [enc setTexture:origTex atIndex:0];
     [enc setTexture:texOut  atIndex:1];
     [enc setBuffer:g_uniformsBuf offset:0 atIndex:0];
-
-    MTLSize gridSize        = { (w + 7) / 8, (h + 7) / 8, 1 };
-    MTLSize threadgroupSize = { 8, 8, 1 };
-    [enc dispatchThreadgroups:gridSize threadsPerThreadgroup:threadgroupSize];
+    MTLSize grid = { (w+7)/8, (h+7)/8, 1 }, tg = { 8, 8, 1 };
+    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
     [enc endEncoding];
-
-    uint64_t t3 = mach_absolute_time();
+    uint64_t t_afterOurs = mach_absolute_time();
 
     *(void **)(surf + kSurfTexOffset) = (__bridge void *)texOut;
 
     if (g_origGaussR13) {
-        void *gaussSelf = g_gaussCtxValue ? g_gaussCtxValue : self;
-        g_origGaussR13(gaussSelf, filter, layer, ctx, opacity, surface,
+        g_origGaussR13(self, filter, layer, ctx, opacity, surface,
                        0.0f, flag, cm, shape, out);
     }
+    uint64_t t_afterGauss = mach_absolute_time();
 
     *(void **)(surf + kSurfTexOffset) = savedOrigTex;
 
-    uint64_t t4 = mach_absolute_time();
-
-    tsum_stop    += (t1 - t0);
-    tsum_compute += (t3 - t1);   // stop_encoders->enc create + dispatch + end
-    tsum_gauss   += (t4 - t3);   // g_origGaussR13 call
+    // cpuside timing, logged every 60 calls
+    tsum_stop  += (t_afterStop  - t_start);
+    tsum_ours  += (t_afterOurs  - t_afterStop);
+    tsum_gauss += (t_afterGauss - t_afterOurs);
     tcount++;
-    if (tcount % 60 == 0) {
-        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
-        double scale_us = (double)tb.numer / tb.denom / 1000.0;
-        double avg_stop    = (double)tsum_stop    / 60 * scale_us;
-        double avg_compute = (double)tsum_compute / 60 * scale_us;
-        double avg_gauss   = (double)tsum_gauss   / 60 * scale_us;
-        lglog("timing: stop=%.0fus compute=%.0fus gauss=%.0fus  total=%.0fus (%.1fms)",
-              avg_stop, avg_compute, avg_gauss,
-              avg_stop + avg_compute + avg_gauss,
-              (avg_stop + avg_compute + avg_gauss) / 1000.0);
-        tsum_stop = tsum_compute = tsum_gauss = 0;
+    if (tcount >= 60) {
+        static mach_timebase_info_data_t tb = {0, 0};
+        if (tb.denom == 0) mach_timebase_info(&tb);
+        double scaleUs = (double)tb.numer / tb.denom / 1000.0;
+        double avgStop  = (double)tsum_stop  / tcount * scaleUs;
+        double avgOurs  = (double)tsum_ours  / tcount * scaleUs;
+        double avgGauss = (double)tsum_gauss / tcount * scaleUs;
+        double avgTotal = avgStop + avgOurs + avgGauss;
+        lglog("timing (avg over %llu calls): stopEncoders=%.0fus  ourCompute=%.0fus  gaussCall=%.0fus  total=%.0fus (%.2fms)",
+              tcount, avgStop, avgOurs, avgGauss, avgTotal, avgTotal);
+        tsum_stop = tsum_ours = tsum_gauss = 0;
+        tcount = 0;
     }
 }
 
+// always "not identity", the caller passes only (self, filter)
 static int ourIdentityStub(void *self, void *filter) {
     return 0;
 }
@@ -572,8 +529,8 @@ static int ourIdentityStub(void *self, void *filter) {
 static bool registerCustomFilter(void) {
     void **filterTableSlot = (void **)LGResolve_FilterTableSlot();
     if (!filterTableSlot) {
-        intptr_t slide = getSlide();
-        filterTableSlot = (void **)(kFB_FilterTable + slide);
+        lglog("registerCustomFilter: could not resolve filter_table, aborting (no fallback)");
+        return false;
     }
     if (!*filterTableSlot) {
         lglog("registerCustomFilter: filter_table null, retrying in 250ms");
@@ -587,8 +544,8 @@ static bool registerCustomFilter(void) {
 
     void **gaussCtxSlot = (void **)LGResolve_GaussianCtxSlot();
     if (!gaussCtxSlot) {
-        intptr_t slide = getSlide();
-        gaussCtxSlot = (void **)(kFB_GaussianCtx + slide);
+        lglog("registerCustomFilter: could not resolve gaussian context, aborting (no fallback)");
+        return false;
     }
     g_gaussCtxValue = (void *)*gaussCtxSlot;
     lglog("registerCustomFilter: g_gaussCtxValue = %p", g_gaussCtxValue);
@@ -597,9 +554,17 @@ static bool registerCustomFilter(void) {
         lglog("registerCustomFilter: gaussian vtable not found");
         return false;
     }
-    lglog("registerCustomFilter: cloning vtable from gaussian @ %p (via resolver)", gaussVtable);
+    lglog("registerCustomFilter: cloning vtable from gaussian @ %p", gaussVtable);
 
-    g_origGaussR13 = (Render13Fn)gaussVtable[13];
+    // render slot shifts across versions (12 on 15.8.8, 13 on 16.x)
+    int renderSlot = LGResolve_RenderVtableSlot((void * const *)gaussVtable, (int)kVtableSlots);
+    if (renderSlot < 0 || renderSlot >= (int)kVtableSlots) {
+        lglog("registerCustomFilter: could not resolve render vtable slot (got %d), aborting", renderSlot);
+        return false;
+    }
+    lglog("registerCustomFilter: render vtable slot = %d", renderSlot);
+
+    g_origGaussR13 = (Render13Fn)gaussVtable[renderSlot];
     lglog("registerCustomFilter: g_origGaussR13 = %p", (void *)g_origGaussR13);
 
     g_customVtable = (void **)mmap(NULL, kVtableSlots * sizeof(void *),
@@ -611,8 +576,8 @@ static bool registerCustomFilter(void) {
         return false;
     }
     memcpy(g_customVtable, gaussVtable, kVtableSlots * sizeof(void *));
-    g_customVtable[0]  = (void *)&ourIdentityStub;
-    g_customVtable[13] = (void *)&ourCustomRender13;
+    g_customVtable[0]          = (void *)&ourIdentityStub;
+    g_customVtable[renderSlot] = (void *)&ourCustomRender13;
 
     g_customCtx = mmap(NULL, 256, PROT_READ | PROT_WRITE,
                         MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -638,32 +603,44 @@ static bool registerCustomFilter(void) {
 
     g_addFilter(atomId, g_customCtx);
     g_filterRegistered = true;
-    lglog("registerCustomFilter: done ctx=%p vtable=%p slot13=%p",
-          g_customCtx, g_customVtable, g_customVtable[13]);
+    lglog("registerCustomFilter: done ctx=%p vtable=%p renderSlot=%d slot=%p",
+          g_customCtx, g_customVtable, renderSlot, g_customVtable[renderSlot]);
     return true;
 }
 
-// dylib constructor, init symbol resolution and register custom filter
 __attribute__((constructor))
 static void tweakInit(void) {
+    { FILE *lf = fopen("/tmp/liquidglass.log", "w"); if (lf) fclose(lf); }
+
+    NSOperatingSystemVersion osv = NSProcessInfo.processInfo.operatingSystemVersion;
+    lglog("===== LiquidGlass (backboardd) on iOS %ld.%ld.%ld =====",
+          (long)osv.majorVersion, (long)osv.minorVersion, (long)osv.patchVersion);
+
     if (!LGSymResolverInit()) {
         lglog("init: LGSymResolverInit failed, QuartzCore not loaded yet?");
         return;
     }
 
-    void *stopEnc = resolveWithFallback("stop_encoders",
-                        LGResolve_StopEncoders(), kFB_StopEncoders);
-    void *internA = resolveWithFallback("CAInternAtomWithCString",
-                        LGResolve_CAInternAtomWithCString(), kFB_InternAtom);
-    void *addF    = resolveWithFallback("add_filter",
-                        LGResolve_AddFilter(), kFB_AddFilter);
+    void *stopEnc = logResolveResult("stop_encoders", LGResolve_StopEncoders());
+    void *internA = logResolveResult("CAInternAtomWithCString", LGResolve_CAInternAtomWithCString());
+    void *addF    = logResolveResult("add_filter", LGResolve_AddFilter());
 
     g_stopEncoders = (StopEncodersFn)stopEnc;
     g_internAtom   = (InternAtomFn)internA;
     g_addFilter    = (AddFilterFn)addF;
 
-    lglog("init: stopEncoders=%p internAtom=%p addFilter=%p",
-          stopEnc, internA, addF);
+    lglog("init: stopEncoders=%p internAtom=%p addFilter=%p", stopEnc, internA, addF);
+
+    if (!stopEnc || !internA || !addF) {
+        lglog("init: required symbol(s) unresolved on this build, not activating (no fallback)");
+        return;
+    }
+
+    g_cmdBufOffset = LGResolve_MetalCmdBufOffset();
+    if (g_cmdBufOffset < 0)
+        lglog("init: command-buffer offset unresolved, filter registers but compute pass is skipped");
+    else
+        lglog("init: MetalContext command-buffer offset = %#lx", (long)g_cmdBufOffset);
 
     g_outTex = new std::unordered_map<uint64_t, id<MTLTexture>>();
 

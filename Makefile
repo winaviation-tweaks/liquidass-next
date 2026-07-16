@@ -1,9 +1,9 @@
-TARGET := iphone:clang:latest:16.6
+TARGET := iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES = backboardd
 THEOS_DEVICE_IP = 127.0.0.1
 FINALPACKAGE = 1
-THEOS_PACKAGE_SCHEME = rootless
-ARCHS = arm64 arm64e
+export THEOS_PACKAGE_SCHEME = rootless
+export ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
