@@ -8,11 +8,16 @@
 #include <time.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <dlfcn.h>
+#include <unistd.h>
 
-// timestamped logger to /tmp/liquidglass.log
+// a bit off topic but this seems to be the only path backboardd could write to other than /tmp
+#define LG_LOG_PATH "/var/mobile/Library/Accessibility/liquidglass.log"
+
+// timestamped logger
 static void lglog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lglog(const char *fmt, ...) {
-    FILE *f = fopen("/tmp/liquidglass.log", "a");
+    FILE *f = fopen(LG_LOG_PATH, "a");
     if (!f) return;
     struct timeval tv; gettimeofday(&tv, NULL);
     struct tm *t = localtime(&tv.tv_sec);
@@ -50,8 +55,8 @@ static const ptrdiff_t kSurfTexOffset = 0x58;
 // how many vtable slots to copy (covers slot 0..21)
 static const size_t kVtableSlots = 22;
 
-// uniforms, mirrors struct in the metal shader exactly (layout must match)
-typedef struct __attribute__((packed)) {
+// match msl natural 8-byte alignment for float2 to prevent struct field layout desync from padding
+typedef struct {
     simd_float2 resolution;
     simd_float2 screenResolution;
     simd_float2 cardOrigin;
@@ -63,7 +68,6 @@ typedef struct __attribute__((packed)) {
     float       refractiveIndex;
     float       specularOpacity;
     float       specularAngle;
-    float       blur;
     simd_float2 wallpaperOrigin;
     simd_float2 samplingTransformX;
     simd_float2 samplingTransformY;
@@ -91,11 +95,19 @@ static StopEncodersFn  g_stopEncoders   = nullptr;
 static InternAtomFn    g_internAtom     = nullptr;
 static AddFilterFn     g_addFilter      = nullptr;
 static Render13Fn      g_origGaussR13   = nullptr; // original render we call after our pass
-static void           *g_gaussCtxValue  = nullptr; // gaussian's CAML::Context value, not the slot ptr
+static void           *g_gaussCtxValue  = nullptr; // raw gaussian vtable ptr (stripped)
 static bool            g_filterRegistered = false;
 
-static void  **g_customVtable = nullptr; // mmap'd 22-slot vtable
-static void   *g_customCtx    = nullptr; // mmap'd CAML::Context-shaped block
+static void  **g_customVtable = nullptr; // mmap'd 22-slot cloned gaussian vtable
+static void   *g_customCtx    = nullptr; // mmap'd FilterSubclass-shaped block
+
+// arm64e vtables cannot be relocated due to address diversification, making PAC devices unsupported
+static const bool kIsPACSlice =
+#if __has_feature(ptrauth_calls)
+    true;
+#else
+    false;
+#endif
 
 static id<MTLComputePipelineState> g_pipeline    = nil;
 static id<MTLBuffer>               g_uniformsBuf = nil;
@@ -104,7 +116,7 @@ static os_unfair_lock g_pipelineLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock g_ppLock       = OS_UNFAIR_LOCK_INIT;
 static bool           g_pipelineInit = false;
 
-// single output texture, no A/B ping-pong (that caused ghosting). heap
+// single output texture per size, no A/B ping-pong (that caused ghosting). heap
 // allocated so it survives past CXA finalization.
 static std::unordered_map<uint64_t, id<MTLTexture>> *g_outTex = nullptr;
 
@@ -131,7 +143,6 @@ struct Uniforms {
     float  refractiveIndex;
     float  specularOpacity;
     float  specularAngle;
-    float  blur;
     float2 wallpaperOrigin;
     float2 samplingTransformX;
     float2 samplingTransformY;
@@ -366,14 +377,55 @@ static void ensureUniforms(__unsafe_unretained id<MTLDevice> device, uint64_t w,
 
     LGUniforms *u = (LGUniforms *)g_uniformsBuf.contents;
 
-    u->screenResolution        = simd_make_float2(750.f, 1334.f); // TODO: read real screen size
+    // screenResolution is a placeholder since private apis returned garbage data, we will binja the struct if it ever becomes necessary
+    /*
+    typedef void *IOMobileFramebufferRef;
+    typedef struct { float width; float height; } IOMobileFramebufferDisplaySize;
+    typedef kern_return_t (*IOMFBGetMainDisplayFn)(IOMobileFramebufferRef *);
+    typedef kern_return_t (*IOMFBGetDisplaySizeFn)(IOMobileFramebufferRef, IOMobileFramebufferDisplaySize *);
+
+    void *iomfb = dlopen("/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/IOMobileFramebuffer",
+                        RTLD_LAZY);
+    if (!iomfb) lglog("screen resolution: dlopen(IOMobileFramebuffer) failed: %s", dlerror());
+
+    IOMFBGetMainDisplayFn getMainDisplay = iomfb ?
+        (IOMFBGetMainDisplayFn)dlsym(iomfb, "IOMobileFramebufferGetMainDisplay") : nullptr;
+    IOMFBGetDisplaySizeFn getDisplaySize = iomfb ?
+        (IOMFBGetDisplaySizeFn)dlsym(iomfb, "IOMobileFramebufferGetDisplaySize") : nullptr;
+    if (iomfb && (!getMainDisplay || !getDisplaySize))
+        lglog("screen resolution: dlsym off IOMobileFramebuffer handle failed (getMainDisplay=%p getDisplaySize=%p)",
+              (void *)getMainDisplay, (void *)getDisplaySize);
+
+    bool gotScreen = false;
+    if (getMainDisplay && getDisplaySize) {
+        IOMobileFramebufferRef fb = NULL;
+        kern_return_t kr1 = getMainDisplay(&fb);
+        if (kr1 == KERN_SUCCESS && fb) {
+            IOMobileFramebufferDisplaySize sz = {0.f, 0.f};
+            kern_return_t kr2 = getDisplaySize(fb, &sz);
+            if (kr2 == KERN_SUCCESS && sz.width > 0.f && sz.height > 0.f) {
+                u->screenResolution = simd_make_float2(sz.width, sz.height);
+                lglog("screen resolution: %.0fx%.0f px (IOMobileFramebuffer)", sz.width, sz.height);
+                gotScreen = true;
+            } else {
+                lglog("screen resolution: GetDisplaySize kr=%#x size=%.0fx%.0f", kr2, sz.width, sz.height);
+            }
+        } else {
+            lglog("screen resolution: GetMainDisplay kr=%#x fb=%p", kr1, fb);
+        }
+    }
+    if (!gotScreen) {
+        u->screenResolution = simd_make_float2(750.f, 1334.f);
+        lglog("screen resolution: IOMobileFramebuffer unavailable, using default");
+    }
+    */
+    u->screenResolution = simd_make_float2(750.f, 1334.f);
     u->cardOrigin               = simd_make_float2(0.f, 0.f);
     u->glassThickness          = 5.f;
     u->refractionScale         = 0.5f;
     u->refractiveIndex         = 1.5f;
     u->specularOpacity         = 0.7f;
     u->specularAngle           = 0.785398f; // pi/4
-    u->blur                    = 8.f;       // informational, actual blur is the chained gaussianBlur
     u->wallpaperOrigin         = simd_make_float2(0.f, 0.f);
     u->samplingTransformX      = simd_make_float2(1.f, 0.f);
     u->samplingTransformY      = simd_make_float2(0.f, 1.f);
@@ -417,6 +469,13 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     static uint64_t tsum_stop = 0, tsum_ours = 0, tsum_gauss = 0, tcount = 0;
     uint64_t t_start = mach_absolute_time();
 
+    // early-call log to pinpoint hanging step if the render server freezes without crashing
+    static uint64_t g_traceCalls = 0;
+    uint64_t callN = ++g_traceCalls;
+#define R13TRACE(...) do { if (callN <= 3) lglog(__VA_ARGS__); } while (0)
+    R13TRACE("R13[%llu] ENTER ctx=%p surface=%p opacity=%.2f scale=%.2f flag=%d",
+             callN, ctx, surface, opacity, scale, (int)flag);
+
     auto *metalCtx = (uint8_t *)ctx;
     auto *surf     = (uint8_t *)surface;
 
@@ -442,6 +501,7 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     uint64_t w = (uint64_t)origTex.width;
     uint64_t h = (uint64_t)origTex.height;
     if (w == 0 || h == 0) { lglog("ourCustomRender13: zero dims, skip"); return; }
+    R13TRACE("R13[%llu] cmdBuf=%p origTex=%p device=%p dims=%llux%llu", callN, rawCmdBuf, rawOrigTex, (__bridge void *)device, w, h);
 
     ensurePipeline(device);
     if (!g_pipeline) { lglog("ourCustomRender13: no pipeline"); return; }
@@ -449,6 +509,7 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     ensureUniforms(device, w, h);
     if (!g_uniformsBuf) { lglog("ourCustomRender13: no uniforms buf"); return; }
     updateUniformsForFrame(w, h);
+    R13TRACE("R13[%llu] pipeline+uniforms ready", callN);
 
     uint64_t key = ((uint64_t)w << 32) | (uint64_t)h;
     id<MTLTexture> texOut = nil;
@@ -476,8 +537,10 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     void *savedOrigTex = rawOrigTex;
 
     if (!g_stopEncoders) { lglog("ourCustomRender13: null stopEncoders"); return; }
+    R13TRACE("R13[%llu] before stopEncoders(%p)", callN, (void *)g_stopEncoders);
     g_stopEncoders(ctx);
     uint64_t t_afterStop = mach_absolute_time();
+    R13TRACE("R13[%llu] after stopEncoders, before encoder", callN);
 
     id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
     if (!enc) { lglog("ourCustomRender13: nil encoder"); return; }
@@ -489,16 +552,21 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
     [enc endEncoding];
     uint64_t t_afterOurs = mach_absolute_time();
+    R13TRACE("R13[%llu] after our compute dispatch", callN);
 
+    // redirect surface source to texOut, let real gaussian render composite with zero scale, then restore
     *(void **)(surf + kSurfTexOffset) = (__bridge void *)texOut;
 
+    R13TRACE("R13[%llu] before g_origGaussR13(%p)", callN, (void *)g_origGaussR13);
     if (g_origGaussR13) {
         g_origGaussR13(self, filter, layer, ctx, opacity, surface,
                        0.0f, flag, cm, shape, out);
     }
     uint64_t t_afterGauss = mach_absolute_time();
+    R13TRACE("R13[%llu] after g_origGaussR13", callN);
 
     *(void **)(surf + kSurfTexOffset) = savedOrigTex;
+    R13TRACE("R13[%llu] DONE", callN);
 
     // cpuside timing, logged every 60 calls
     tsum_stop  += (t_afterStop  - t_start);
@@ -518,10 +586,16 @@ static void ourCustomRender13(void *self, void *filter, void *layer, void *ctx,
         tsum_stop = tsum_ours = tsum_gauss = 0;
         tcount = 0;
     }
+#undef R13TRACE
 }
 
-// always "not identity", the caller passes only (self, filter)
+// returns not identity for the non-pac clone path while the pac path keeps the real identity
 static int ourIdentityStub(void *self, void *filter) {
+    static bool identityLogged = false;
+    if (!identityLogged) {
+        identityLogged = true;
+        lglog("ourIdentityStub: first call, CA is dispatching into our vtable (self=%p filter=%p)", self, filter);
+    }
     return 0;
 }
 
@@ -547,48 +621,23 @@ static bool registerCustomFilter(void) {
         lglog("registerCustomFilter: could not resolve gaussian context, aborting (no fallback)");
         return false;
     }
-    g_gaussCtxValue = (void *)*gaussCtxSlot;
-    lglog("registerCustomFilter: g_gaussCtxValue = %p", g_gaussCtxValue);
-    void **gaussVtable = (void **)*gaussCtxSlot;
+    // strip PAC signature from descriptor vtable pointer to get raw address before dereferencing
+    g_gaussCtxValue = LGSymStripCode((void *)*gaussCtxSlot);
+    lglog("registerCustomFilter: g_gaussCtxValue = %p (raw from %p)", g_gaussCtxValue, *gaussCtxSlot);
+    void **gaussVtable = (void **)g_gaussCtxValue;
     if (!gaussVtable) {
         lglog("registerCustomFilter: gaussian vtable not found");
         return false;
     }
-    lglog("registerCustomFilter: cloning vtable from gaussian @ %p", gaussVtable);
+    lglog("registerCustomFilter: gaussian vtable @ %p", gaussVtable);
 
-    // render slot shifts across versions (12 on 15.8.8, 13 on 16.x)
+    // render slot shifts across versions (12 on 15.8.8/16.2, 13 on 16.7)
     int renderSlot = LGResolve_RenderVtableSlot((void * const *)gaussVtable, (int)kVtableSlots);
     if (renderSlot < 0 || renderSlot >= (int)kVtableSlots) {
         lglog("registerCustomFilter: could not resolve render vtable slot (got %d), aborting", renderSlot);
         return false;
     }
     lglog("registerCustomFilter: render vtable slot = %d", renderSlot);
-
-    g_origGaussR13 = (Render13Fn)gaussVtable[renderSlot];
-    lglog("registerCustomFilter: g_origGaussR13 = %p", (void *)g_origGaussR13);
-
-    g_customVtable = (void **)mmap(NULL, kVtableSlots * sizeof(void *),
-                                    PROT_READ | PROT_WRITE,
-                                    MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (g_customVtable == MAP_FAILED) {
-        lglog("registerCustomFilter: vtable mmap failed errno=%d", errno);
-        g_customVtable = nullptr;
-        return false;
-    }
-    memcpy(g_customVtable, gaussVtable, kVtableSlots * sizeof(void *));
-    g_customVtable[0]          = (void *)&ourIdentityStub;
-    g_customVtable[renderSlot] = (void *)&ourCustomRender13;
-
-    g_customCtx = mmap(NULL, 256, PROT_READ | PROT_WRITE,
-                        MAP_ANON | MAP_PRIVATE, -1, 0);
-    if (g_customCtx == MAP_FAILED) {
-        lglog("registerCustomFilter: ctx mmap failed errno=%d", errno);
-        munmap(g_customVtable, kVtableSlots * sizeof(void *));
-        g_customVtable = nullptr;
-        g_customCtx    = nullptr;
-        return false;
-    }
-    *(void **)g_customCtx = g_customVtable;
 
     if (!g_internAtom || !g_addFilter) {
         lglog("registerCustomFilter: internAtom=%p addFilter=%p, aborting",
@@ -601,20 +650,51 @@ static bool registerCustomFilter(void) {
           kCustomFilterTypeName, atomId, gaussAtom,
           atomId == gaussAtom ? "YES-BAD" : "no");
 
+    // clone gaussian vtable to override identity and render slots, arm64e is noop as vtables cannot be relocated
+    g_origGaussR13 = (Render13Fn)LGSymMakeCallable(gaussVtable[renderSlot]);
+    lglog("registerCustomFilter: g_origGaussR13 = %p", (void *)g_origGaussR13);
+
+    g_customVtable = (void **)mmap(NULL, kVtableSlots * sizeof(void *),
+                                    PROT_READ | PROT_WRITE,
+                                    MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (g_customVtable == MAP_FAILED) {
+        lglog("registerCustomFilter: vtable mmap failed errno=%d", errno);
+        g_customVtable = nullptr;
+        return false;
+    }
+    memcpy(g_customVtable, gaussVtable, kVtableSlots * sizeof(void *));
+    g_customVtable[0]          = LGSymStripCode((void *)&ourIdentityStub);
+    g_customVtable[renderSlot] = LGSymStripCode((void *)&ourCustomRender13);
+
+    g_customCtx = mmap(NULL, 256, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (g_customCtx == MAP_FAILED) {
+        lglog("registerCustomFilter: ctx mmap failed errno=%d", errno);
+        munmap(g_customVtable, kVtableSlots * sizeof(void *));
+        g_customVtable = nullptr;
+        g_customCtx    = nullptr;
+        return false;
+    }
+    *(void **)g_customCtx = g_customVtable;
+
     g_addFilter(atomId, g_customCtx);
     g_filterRegistered = true;
-    lglog("registerCustomFilter: done ctx=%p vtable=%p renderSlot=%d slot=%p",
-          g_customCtx, g_customVtable, renderSlot, g_customVtable[renderSlot]);
+    lglog("registerCustomFilter: done ctx=%p renderSlot=%d atom=0x%x", g_customCtx, renderSlot, atomId);
     return true;
 }
 
 __attribute__((constructor))
 static void tweakInit(void) {
-    { FILE *lf = fopen("/tmp/liquidglass.log", "w"); if (lf) fclose(lf); }
+    { FILE *lf = fopen(LG_LOG_PATH, "w"); if (lf) fclose(lf); }
 
     NSOperatingSystemVersion osv = NSProcessInfo.processInfo.operatingSystemVersion;
     lglog("===== LiquidGlass (backboardd) on iOS %ld.%ld.%ld =====",
           (long)osv.majorVersion, (long)osv.minorVersion, (long)osv.patchVersion);
+
+    // arm64e is unsupported because address-diversified pac signatures prevent vtable relocation and cause crashes
+    if (kIsPACSlice) {
+        lglog("init: unsupported (PAC available)");
+        return;
+    }
 
     if (!LGSymResolverInit()) {
         lglog("init: LGSymResolverInit failed, QuartzCore not loaded yet?");
@@ -625,9 +705,10 @@ static void tweakInit(void) {
     void *internA = logResolveResult("CAInternAtomWithCString", LGResolve_CAInternAtomWithCString());
     void *addF    = logResolveResult("add_filter", LGResolve_AddFilter());
 
-    g_stopEncoders = (StopEncodersFn)stopEnc;
-    g_internAtom   = (InternAtomFn)internA;
-    g_addFilter    = (AddFilterFn)addF;
+    // PAC-sign the scanned addresses so our authenticated calls succeed on arm64e
+    g_stopEncoders = (StopEncodersFn)LGSymMakeCallable(stopEnc);
+    g_internAtom   = (InternAtomFn)LGSymMakeCallable(internA);
+    g_addFilter    = (AddFilterFn)LGSymMakeCallable(addF);
 
     lglog("init: stopEncoders=%p internAtom=%p addFilter=%p", stopEnc, internA, addF);
 

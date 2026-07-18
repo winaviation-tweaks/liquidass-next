@@ -1,7 +1,7 @@
 Package: dylv.liquidglass
 Name: LiquidGlass
-Version: 0.0.2
-Architecture: iphoneos-arm64
+Version: 0.0.3
+Architecture: iphoneos-arm
 Description: Liquid (Gl)ass 0.1.0b architecture prototype
 Maintainer: dylv
 Author: dylv

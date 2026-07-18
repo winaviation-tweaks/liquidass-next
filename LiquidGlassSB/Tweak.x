@@ -6,10 +6,12 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-// springboard logger
+// a bit off topic but this seems to be the only path backboardd could write to other than /tmp
+#define LG_LOG_PATH "/var/mobile/Library/Accessibility/liquidglass.log"
+
 static void sblog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void sblog(const char *fmt, ...) {
-    FILE *f = fopen("/tmp/liquidglass.log", "a");
+    FILE *f = fopen(LG_LOG_PATH, "a");
     if (!f) return;
     fputs("[LGSB] ", f);
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);

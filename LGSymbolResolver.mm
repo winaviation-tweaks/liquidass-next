@@ -8,11 +8,33 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <ptrauth.h>
 
-// symbol resolver logger
+// noops on the non-arm64e slice
+void *LGSymMakeCallable(void *codeAddr) {
+#if __has_feature(ptrauth_calls)
+    if (!codeAddr) return codeAddr;
+    codeAddr = ptrauth_strip(codeAddr, ptrauth_key_function_pointer);
+    return ptrauth_sign_unauthenticated(codeAddr, ptrauth_key_function_pointer, 0);
+#else
+    return codeAddr;
+#endif
+}
+
+void *LGSymStripCode(void *codeAddr) {
+#if __has_feature(ptrauth_calls)
+    if (!codeAddr) return codeAddr;
+    return ptrauth_strip(codeAddr, ptrauth_key_function_pointer);
+#else
+    return codeAddr;
+#endif
+}
+
+// symbol resolver logger (same file as Tweak.mm's lglog)
+#define LG_LOG_PATH "/var/mobile/Library/Accessibility/liquidglass.log"
 static void rlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void rlog(const char *fmt, ...) {
-    FILE *f = fopen("/tmp/liquidglass.log", "a");
+    FILE *f = fopen(LG_LOG_PATH, "a");
     if (!f) return;
     fputs("[LGSYM] ", f);
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
@@ -209,7 +231,7 @@ static uint8_t *findFunctionStartBackward(uint8_t *withinFunc, size_t maxWindow)
     return nullptr;
 }
 
-// try dlsym first, fall back to prologue scan
+// try dlsym, fall back to unique prologue scan, and back up to pacibsp if present to prevent retab crashes
 void *LGResolve_CAInternAtomWithCString(void) {
     void *sym = LGSymResolveExported("_CAInternAtomWithCString");
     if (sym) return sym;
@@ -219,6 +241,8 @@ void *LGResolve_CAInternAtomWithCString(void) {
     uint32_t *base  = (uint32_t *)g_qcTextBase;
     uint32_t *limit = (uint32_t *)(g_qcTextBase + g_qcTextSize) - 6;
 
+    void *result = nullptr;
+    int matchCount = 0;
     for (uint32_t *p = base; p < limit; p++) {
         if (p[0] != 0xA9BE4FF4u) continue; // stp x20,x19,[sp,#-0x20]!
         if (p[1] != 0xA9017BFDu) continue; // stp x29,x30,[sp,#0x10]
@@ -228,13 +252,20 @@ void *LGResolve_CAInternAtomWithCString(void) {
         if ((p[4] & 0x02000000u) == 0)           continue; // positive -> skip
         if (p[5] != 0xAA0003F4u) continue; // mov x20,x0
 
-        void *result = (void *)p;
-        rlog("CAInternAtom: found via prologue scan -> %p", result);
-        return result;
+        matchCount++;
+        if (matchCount == 1)
+            result = (p > base && isPACIBSP(p[-1])) ? (void *)(p - 1) : (void *)p;
+        else
+            break; // ambiguous, no need to keep scanning
     }
 
-    rlog("CAInternAtom: prologue scan found no match");
-    return nullptr;
+    if (matchCount != 1) {
+        rlog("CAInternAtom: prologue scan found %d matches, not trusting an ambiguous result", matchCount);
+        return nullptr;
+    }
+
+    rlog("CAInternAtom: found via prologue scan -> %p", result);
+    return result;
 }
 
 // atom values aint stable across builds, so gaussian is found by cluster
@@ -283,7 +314,8 @@ static void scanGaussianSite(void) {
     uint32_t *limit = (uint32_t *)(g_qcTextBase + g_qcTextSize) - 8;
 
     typedef uint32_t (*InternFn)(const char *);
-    InternFn intern = (InternFn)LGResolve_CAInternAtomWithCString();
+    // pac-sign the scanned address so the authenticated call below succeeds on arm64e
+    InternFn intern = (InternFn)LGSymMakeCallable(LGResolve_CAInternAtomWithCString());
     uint32_t gaussAtom = intern ? intern("gaussianBlur") : 0;
     rlog("scanGaussianSite: runtime gaussianBlur atom = 0x%x%s", gaussAtom,
          gaussAtom ? "" : " (intern unavailable -> positional fallback)");
@@ -468,34 +500,57 @@ ptrdiff_t LGResolve_MetalCmdBufOffset(void) {
     return -1;
 }
 
-// base class BlurFilter::render forwarder sits at slot K and dispatches to
-// vtable[K+1], the derived render CA actually invokes (12 on 15.8.8, 13 on 16.x)
+// find target slot from non-PAC or PAC-hardened BlurFilter::render vtable dispatch to verify K->K+1 invariant
 int LGResolve_RenderVtableSlot(void * const *vtable, int maxSlots) {
     if (!vtable) return -1;
 
     for (int i = 0; i + 1 < maxSlots; i++) {
-        uint32_t *fn = (uint32_t *)vtable[i];
+        // strip PAC signature from vtable entry to get raw code address before checking/scanning
+        uint32_t *fn = (uint32_t *)LGSymStripCode(vtable[i]);
         if (!fn || !LGSymAddressInQuartzCoreImage((void *)fn)) continue;
 
-        for (int k = 0; k + 1 < 20; k++) {
+        for (int k = 0; k + 1 < 24; k++) {
             uint32_t ins = fn[k];
             if (ins == 0xD65F03C0u) break;         // ret -> end of function
-            if (ins != 0xF9400008u) continue;      // ldr x8,[x0]
-            if ((fn[k + 1] & 0xFFC003FFu) != 0xF9400108u) continue; // ldr x8,[x8,#imm]
 
-            int targetSlot = (int)((fn[k + 1] >> 10) & 0xFFFu); // imm/8
-            if (targetSlot != i + 1) continue;     // forward-to-next-slot invariant
-
-            bool dispatched = false;
-            for (int j = k + 2; j < k + 16; j++) {
-                uint32_t b = fn[j];
-                if (b == 0xD61F0100u || b == 0xD63F0100u) { dispatched = true; break; } // br/blr x8
-                if (b == 0xD65F03C0u) break;
+            // plain forwarder: ldr x8,[x0] ; ldr x8,[x8,#imm] ; ... ; br/blr x8
+            if (ins == 0xF9400008u && (fn[k + 1] & 0xFFC003FFu) == 0xF9400108u) {
+                int targetSlot = (int)((fn[k + 1] >> 10) & 0xFFFu); // imm/8
+                if (targetSlot != i + 1) continue;
+                bool dispatched = false;
+                for (int j = k + 2; j < k + 16; j++) {
+                    uint32_t b = fn[j];
+                    if (b == 0xD61F0100u || b == 0xD63F0100u) { dispatched = true; break; } // br/blr x8
+                    if (b == 0xD65F03C0u) break;
+                }
+                if (!dispatched) continue;
+                rlog("render-slot: forwarder at vtable[%d] -> render vtable[%d]", i, targetSlot);
+                return targetSlot;
             }
-            if (!dispatched) continue;
 
-            rlog("render-slot: forwarder at vtable[%d] -> render vtable[%d]", i, targetSlot);
-            return targetSlot;
+            // PAC forwarder: ldr x16,[x0] ; ... ; ldr x8,[x16,#off]! ; ... ; blraa x8
+            if (ins == 0xF9400010u) {              // ldr x16,[x0]
+                for (int j = k + 1; j + 1 < 24 && j < k + 10; j++) {
+                    uint32_t l = fn[j];
+                    // ldr x8,[x16,#imm]! (pre-indexed, unscaled imm9): Rn=x16 Rt=x8
+                    if ((l & 0xFFE00C00u) != 0xF8400C00u) continue;
+                    if (((l >> 5) & 0x1Fu) != 16u || (l & 0x1Fu) != 8u) continue;
+                    int off = (int)((l >> 12) & 0x1FFu);  // byte offset
+                    int targetSlot = off / 8;
+                    if (targetSlot != i + 1) break;       // wrong forwarder, next slot
+                    bool dispatched = false;
+                    for (int m = j + 1; m < j + 10 && m < 24; m++) {
+                        uint32_t b = fn[m];
+                        if ((b & 0xFFFFF800u) == 0xD73F0800u ||  // blraa/blrab x8,xN
+                            (b & 0xFFFFF800u) == 0xD71F0800u)    // braa/brab  x8,xN
+                            { dispatched = true; break; }
+                        if (b == 0xD65F03C0u) break;
+                    }
+                    if (!dispatched) break;
+                    rlog("render-slot: PAC forwarder at vtable[%d] -> render vtable[%d]", i, targetSlot);
+                    return targetSlot;
+                }
+            }
         }
     }
     rlog("render-slot: render forwarder not found (checked %d slots)", maxSlots);

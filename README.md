@@ -2,7 +2,9 @@
 
 test prototype for Liquid (Gl)ass 0.1.0b
 
-currently hopefully works on all iOS 15 and iOS 16 versions. (15.8.8 and 16.7.x confirmed to work)
+currently hopefully works on all iOS 15 and iOS 16 versions. (every iOS 15 version and 16.7.x confirmed to work)
+
+only works on A11 and lower since i've been running into PAC issues
 
 ## Overview
 
@@ -144,7 +146,6 @@ typedef struct {
     float       refractiveIndex;         // IOR (1.0 = none, 1.5 = glass)
     float       specularOpacity;         // highlight brightness
     float       specularAngle;           // light direction in radians
-    float       blur;                    // informational only (dropped it from liquidass)
     simd_float2 wallpaperOrigin;         // wallpaper offset
     simd_float2 samplingTransformX;      // backdrop -> screen mapping row 0
     simd_float2 samplingTransformY;      // backdrop -> screen mapping row 1
@@ -205,4 +206,13 @@ the custom filter registration is:
 ## Important Notes
 
 - backboardd CPU can spike (~50-80%) while the floating view is dragged. isolation testing (down to a pure stock UIVisualEffectView with zero custom code) showed this is inherent to CABackdropLayer's live capture mechanism, not our impl's problems
-- graphical issues still exist, trying my best to fix them
+
+## A12+ (arm64e) unsupported
+
+the whole thing hinges on cloning the gaussian FilterSubclass vtable into a fresh mmap and pointing the filter ctx at it but arm64e makes that impossible, the object vptr and every vtable entry are PAC-signed with addr diversity, so relocating the vtable invalidates every sig. CA auths on dispatch and dies, thats exactly what PAC vtable hardening is designed to stop
+
+everything tried on arm64e crashed, in order:
+- clone as is: crashed at first dispatch in `CA::Render::Filter::evaluate_identity` (autda on our raw vptr)
+- resign the vptr for our ctx and inject via an MSHookFunction hook on `GaussianBlurFilter::render` instead of cloning, got all the way to our render firing, but compositing needs the real gaussian render to run its blur pass, and that either did nothing (scale 0) or ran the full multipass blur, which readded blur additionally crashing the AGX driver (`blur_surface` -> bad intermediate tex) once our compute touches MetalContext
+
+resigning all ~10-20 dispatched vtable slots by hand (each an exact or crash discriminator) is not really a good idea so arm64e is dropped. the arm64e slice detects itself at load (`__has_feature(ptrauth_calls)`) and returns immediately, leaving the device unmodded. A12+ needs a very different approach (no vtable relocation), revisiting if ever
