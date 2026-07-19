@@ -129,7 +129,4 @@ jobs:
             
             **Commit SHA:** ${{ github.sha }}
             **Triggered by:** @${{ github.actor }}
-            
-            > [!NOTE]
-            > This prototype tweak will forever stay on version `0.0.1`.
           token: ${{ secrets.GITHUB_TOKEN }}
