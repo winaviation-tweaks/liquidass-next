@@ -1,3 +1,8 @@
+0.1.0b has been released, repo now archived.
+
+<details>
+<summary>view old README</summary>
+
 # liquidass-next
 
 test prototype for Liquid (Gl)ass 0.1.0b
@@ -216,3 +221,5 @@ everything tried on arm64e crashed, in order:
 - resign the vptr for our ctx and inject via an MSHookFunction hook on `GaussianBlurFilter::render` instead of cloning, got all the way to our render firing, but compositing needs the real gaussian render to run its blur pass, and that either did nothing (scale 0) or ran the full multipass blur, which readded blur additionally crashing the AGX driver (`blur_surface` -> bad intermediate tex) once our compute touches MetalContext
 
 resigning all ~10-20 dispatched vtable slots by hand (each an exact or crash discriminator) is not really a good idea so arm64e is dropped. the arm64e slice detects itself at load (`__has_feature(ptrauth_calls)`) and returns immediately, leaving the device unmodded. A12+ needs a very different approach (no vtable relocation), revisiting if ever
+
+</details>
